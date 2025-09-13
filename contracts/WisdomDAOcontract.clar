@@ -1,3 +1,4 @@
+
 ;; title: WisdomDAO - Collective Intelligence Marketplace
 ;; version: 1.0.0
 ;; summary: A stake-to-predict platform where accuracy builds reputation capital
@@ -124,24 +125,27 @@
   (duration uint))
   (let (
     (prediction-id (var-get next-prediction-id))
-    (end-block (+ block-height duration))
+    (end-block (+ stacks-block-height duration))
   )
     (asserts! (<= duration MAX_PREDICTION_DURATION) ERR_INVALID_OUTCOME)
-    (try! (map-set predictions
-      { prediction-id: prediction-id }
-      {
-        creator: tx-sender,
-        title: title,
-        description: description,
-        domain: domain,
-        end-block: end-block,
-        total-stake-yes: u0,
-        total-stake-no: u0,
-        outcome: none,
-        quality-score: u50, ;; default quality score
-        resolved-block: none
-      }
-    ))
+    (begin
+      (map-set predictions
+        { prediction-id: prediction-id }
+        {
+          creator: tx-sender,
+          title: title,
+          description: description,
+          domain: domain,
+          end-block: end-block,
+          total-stake-yes: u0,
+          total-stake-no: u0,
+          outcome: none,
+          quality-score: u50, ;; default quality score
+          resolved-block: none
+        }
+      )
+      (ok true)
+    )
     (var-set next-prediction-id (+ prediction-id u1))
     (try! (update-user-curation-stats tx-sender))
     (print { event: "prediction-created", prediction-id: prediction-id, creator: tx-sender })
@@ -157,7 +161,7 @@
                      (map-get? user-predictions { user: tx-sender, prediction-id: prediction-id })))
   )
     (asserts! (>= amount MIN_STAKE) ERR_INSUFFICIENT_STAKE)
-    (asserts! (< block-height (get end-block prediction-data)) ERR_PREDICTION_CLOSED)
+    (asserts! (< stacks-block-height (get end-block prediction-data)) ERR_PREDICTION_CLOSED)
     (asserts! (is-none (get outcome prediction-data)) ERR_ALREADY_RESOLVED)
     
     ;; Transfer tokens from user
@@ -196,7 +200,7 @@
   )
     (asserts! (or (is-eq tx-sender (get creator prediction-data)) 
                   (is-eq tx-sender CONTRACT_OWNER)) ERR_UNAUTHORIZED)
-    (asserts! (>= block-height (get end-block prediction-data)) ERR_PREDICTION_CLOSED)
+    (asserts! (>= stacks-block-height (get end-block prediction-data)) ERR_PREDICTION_CLOSED)
     (asserts! (is-none (get outcome prediction-data)) ERR_ALREADY_RESOLVED)
     
     (map-set predictions { prediction-id: prediction-id }
@@ -441,7 +445,7 @@
 )
 
 ;; Update user curation statistics
-(define-private (update-user-curation-stats (user principal))
+(define-public (update-user-curation-stats (user principal))
   (let (
     (current-curator (default-to { total-curated: u0, quality-rating: u50, is-verified: false }
                       (map-get? question-curators { user: user })))
