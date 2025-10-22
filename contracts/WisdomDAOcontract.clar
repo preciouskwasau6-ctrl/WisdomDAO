@@ -29,17 +29,26 @@
 (define-constant ERR_INVALID_OUTCOME (err u106))
 (define-constant ERR_ALREADY_RESOLVED (err u107))
 (define-constant ERR_INSUFFICIENT_BALANCE (err u108))
+(define-constant ERR_DIVISION_BY_ZERO (err u109))
+(define-constant ERR_OVERFLOW (err u110))
+(define-constant ERR_ALREADY_INITIALIZED (err u111))
+(define-constant ERR_PAUSED (err u112))
+(define-constant ERR_INVALID_INPUT (err u113))
+(define-constant ERR_PREDICTION_CHANGED (err u114))
 
 (define-constant MIN_STAKE u1000000) ;; 1 WISDOM token (6 decimals)
 (define-constant PLATFORM_FEE u50) ;; 5% fee (basis points / 100)
 (define-constant ACCURACY_THRESHOLD u80) ;; 80% accuracy needed for NFT minting
 (define-constant MAX_PREDICTION_DURATION u144) ;; ~1 day in blocks
+(define-constant MAX_STAKE u1000000000000) ;; Maximum stake to prevent overflow
 
 ;; data vars
 (define-data-var next-prediction-id uint u1)
 (define-data-var next-nft-id uint u1)
 (define-data-var total-wisdom-supply uint u0)
 (define-data-var platform-treasury uint u0)
+(define-data-var initialized bool false)
+(define-data-var paused bool false)
 
 ;; data maps
 (define-map predictions
@@ -107,12 +116,15 @@
 
 ;; public functions
 
-;; Initialize the platform with initial token supply
+;; Initialize the platform with initial token supply (one-time only)
 (define-public (initialize (initial-supply uint))
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
+    (asserts! (not (var-get initialized)) ERR_ALREADY_INITIALIZED)
+    (asserts! (> initial-supply u0) ERR_INVALID_INPUT)
     (try! (ft-mint? wisdom-token initial-supply CONTRACT_OWNER))
     (var-set total-wisdom-supply initial-supply)
+    (var-set initialized true)
     (ok true)
   )
 )
@@ -127,27 +139,31 @@
     (prediction-id (var-get next-prediction-id))
     (end-block (+ stacks-block-height duration))
   )
+    (asserts! (not (var-get paused)) ERR_PAUSED)
+    (asserts! (> duration u0) ERR_INVALID_INPUT)
     (asserts! (<= duration MAX_PREDICTION_DURATION) ERR_INVALID_OUTCOME)
-    (begin
-      (map-set predictions
-        { prediction-id: prediction-id }
-        {
-          creator: tx-sender,
-          title: title,
-          description: description,
-          domain: domain,
-          end-block: end-block,
-          total-stake-yes: u0,
-          total-stake-no: u0,
-          outcome: none,
-          quality-score: u50, ;; default quality score
-          resolved-block: none
-        }
-      )
-      (ok true)
+    (asserts! (> (len title) u0) ERR_INVALID_INPUT)
+    (asserts! (> (len description) u0) ERR_INVALID_INPUT)
+    (asserts! (> (len domain) u0) ERR_INVALID_INPUT)
+    
+    (map-set predictions
+      { prediction-id: prediction-id }
+      {
+        creator: tx-sender,
+        title: title,
+        description: description,
+        domain: domain,
+        end-block: end-block,
+        total-stake-yes: u0,
+        total-stake-no: u0,
+        outcome: none,
+        quality-score: u50, ;; default quality score
+        resolved-block: none
+      }
     )
+    
     (var-set next-prediction-id (+ prediction-id u1))
-    (try! (update-user-curation-stats tx-sender))
+    (unwrap-panic (update-user-curation-stats tx-sender))
     (print { event: "prediction-created", prediction-id: prediction-id, creator: tx-sender })
     (ok prediction-id)
   )
@@ -157,12 +173,28 @@
 (define-public (stake-prediction (prediction-id uint) (prediction bool) (amount uint))
   (let (
     (prediction-data (unwrap! (map-get? predictions { prediction-id: prediction-id }) ERR_NOT_FOUND))
-    (existing-stake (default-to { stake-amount: u0, prediction: prediction, claimed: false } 
-                     (map-get? user-predictions { user: tx-sender, prediction-id: prediction-id })))
+    (existing-stake (map-get? user-predictions { user: tx-sender, prediction-id: prediction-id }))
+    (current-yes-stake (get total-stake-yes prediction-data))
+    (current-no-stake (get total-stake-no prediction-data))
   )
+    (asserts! (not (var-get paused)) ERR_PAUSED)
+    (asserts! (> amount u0) ERR_INVALID_INPUT)
     (asserts! (>= amount MIN_STAKE) ERR_INSUFFICIENT_STAKE)
+    (asserts! (<= amount MAX_STAKE) ERR_OVERFLOW)
     (asserts! (< stacks-block-height (get end-block prediction-data)) ERR_PREDICTION_CLOSED)
     (asserts! (is-none (get outcome prediction-data)) ERR_ALREADY_RESOLVED)
+    
+    ;; Prevent changing prediction after initial stake
+    (match existing-stake
+      stake-data (asserts! (is-eq (get prediction stake-data) prediction) ERR_PREDICTION_CHANGED)
+      true
+    )
+    
+    ;; Check for overflow before adding
+    (if prediction
+      (asserts! (<= (+ current-yes-stake amount) MAX_STAKE) ERR_OVERFLOW)
+      (asserts! (<= (+ current-no-stake amount) MAX_STAKE) ERR_OVERFLOW)
+    )
     
     ;; Transfer tokens from user
     (try! (ft-transfer? wisdom-token amount tx-sender (as-contract tx-sender)))
@@ -170,23 +202,23 @@
     ;; Update prediction totals
     (if prediction
       (map-set predictions { prediction-id: prediction-id }
-        (merge prediction-data { total-stake-yes: (+ (get total-stake-yes prediction-data) amount) }))
+        (merge prediction-data { total-stake-yes: (+ current-yes-stake amount) }))
       (map-set predictions { prediction-id: prediction-id }
-        (merge prediction-data { total-stake-no: (+ (get total-stake-no prediction-data) amount) }))
+        (merge prediction-data { total-stake-no: (+ current-no-stake amount) }))
     )
     
     ;; Update user stake
     (map-set user-predictions 
       { user: tx-sender, prediction-id: prediction-id }
       {
-        stake-amount: (+ (get stake-amount existing-stake) amount),
+        stake-amount: (+ (default-to u0 (get stake-amount existing-stake)) amount),
         prediction: prediction,
         claimed: false
       }
     )
     
     ;; Update user stats
-    (try! (update-user-stake-stats tx-sender amount))
+    (unwrap-panic (update-user-stake-stats tx-sender amount))
     
     (print { event: "stake-placed", user: tx-sender, prediction-id: prediction-id, amount: amount, prediction: prediction })
     (ok true)
@@ -206,7 +238,7 @@
     (map-set predictions { prediction-id: prediction-id }
       (merge prediction-data { 
         outcome: (some outcome),
-        resolved-block: (some block-height)
+        resolved-block: (some stacks-block-height)
       })
     )
     
@@ -235,25 +267,31 @@
       (user-stake-amount (get stake-amount user-stake))
       (platform-fee-amount (/ (* total-losing-stake PLATFORM_FEE) u1000))
       (remaining-pool (- total-losing-stake platform-fee-amount))
-      (user-reward (+ user-stake-amount (/ (* user-stake-amount remaining-pool) total-winning-stake)))
     )
-      ;; Transfer rewards to user
-      (try! (as-contract (ft-transfer? wisdom-token user-reward tx-sender tx-sender)))
+      ;; Check for division by zero
+      (asserts! (> total-winning-stake u0) ERR_DIVISION_BY_ZERO)
       
-      ;; Update platform treasury
-      (var-set platform-treasury (+ (var-get platform-treasury) platform-fee-amount))
-      
-      ;; Mark as claimed
-      (map-set user-predictions
-        { user: tx-sender, prediction-id: prediction-id }
-        (merge user-stake { claimed: true })
+      (let (
+        (user-reward (+ user-stake-amount (/ (* user-stake-amount remaining-pool) total-winning-stake)))
       )
-      
-      ;; Update user stats
-      (try! (update-user-success-stats tx-sender user-reward))
-      
-      (print { event: "rewards-claimed", user: tx-sender, prediction-id: prediction-id, reward: user-reward })
-      (ok user-reward)
+        ;; Mark as claimed BEFORE transfer (checks-effects-interactions)
+        (map-set user-predictions
+          { user: tx-sender, prediction-id: prediction-id }
+          (merge user-stake { claimed: true })
+        )
+        
+        ;; Update platform treasury
+        (var-set platform-treasury (+ (var-get platform-treasury) platform-fee-amount))
+        
+        ;; Update user stats
+        (unwrap-panic (update-user-success-stats tx-sender user-reward))
+        
+        ;; Transfer rewards to user (last step)
+        (try! (as-contract (ft-transfer? wisdom-token user-reward tx-sender contract-caller)))
+        
+        (print { event: "rewards-claimed", user: tx-sender, prediction-id: prediction-id, reward: user-reward })
+        (ok user-reward)
+      )
     )
   )
 )
@@ -262,15 +300,17 @@
 (define-public (mint-knowledge-nft (prediction-id uint) (uri (string-ascii 256)))
   (let (
     (prediction-data (unwrap! (map-get? predictions { prediction-id: prediction-id }) ERR_NOT_FOUND))
-    (user-stats (get-user-stats-or-default tx-sender))
+    (user-stats-data (get-user-stats-or-default tx-sender))
     (user-stake (unwrap! (map-get? user-predictions { user: tx-sender, prediction-id: prediction-id }) ERR_NOT_FOUND))
     (nft-id (var-get next-nft-id))
   )
+    (asserts! (not (var-get paused)) ERR_PAUSED)
+    (asserts! (> (len uri) u0) ERR_INVALID_INPUT)
     (asserts! (is-some (get outcome prediction-data)) ERR_NOT_FOUND)
     (asserts! (get claimed user-stake) ERR_UNAUTHORIZED)
     (asserts! (is-eq (get prediction user-stake) 
                      (unwrap-panic (get outcome prediction-data))) ERR_INVALID_OUTCOME)
-    (asserts! (>= (get reputation-score user-stats) (* ACCURACY_THRESHOLD u100)) ERR_INSUFFICIENT_BALANCE)
+    (asserts! (>= (get reputation-score user-stats-data) (* ACCURACY_THRESHOLD u100)) ERR_INSUFFICIENT_BALANCE)
     
     (try! (nft-mint? knowledge-nft nft-id tx-sender))
     
@@ -279,9 +319,9 @@
       {
         prediction-id: prediction-id,
         creator: tx-sender,
-        accuracy-score: (get reputation-score user-stats),
+        accuracy-score: (get reputation-score user-stats-data),
         domain: (get domain prediction-data),
-        minted-block: block-height,
+        minted-block: stacks-block-height,
         uri: uri
       }
     )
@@ -306,6 +346,30 @@
       (merge prediction-data { quality-score: quality-score })
     )
     
+    (ok true)
+  )
+)
+
+;; Verify curator (only contract owner)
+(define-public (verify-curator (curator principal))
+  (let (
+    (curator-data (default-to { total-curated: u0, quality-rating: u50, is-verified: false }
+                   (map-get? question-curators { user: curator })))
+  )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
+    (map-set question-curators
+      { user: curator }
+      (merge curator-data { is-verified: true })
+    )
+    (ok true)
+  )
+)
+
+;; Pause/unpause contract (only contract owner)
+(define-public (set-paused (paused-state bool))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
+    (var-set paused paused-state)
     (ok true)
   )
 )
@@ -362,9 +426,10 @@
         (platform-fee-amount (/ (* total-losing-stake PLATFORM_FEE) u1000))
         (remaining-pool (- total-losing-stake platform-fee-amount))
       )
-        (if (> total-winning-stake u0)
-          (ok (+ user-stake-amount (/ (* user-stake-amount remaining-pool) total-winning-stake)))
+        ;; Check for division by zero
+        (if (is-eq total-winning-stake u0)
           (ok user-stake-amount)
+          (ok (+ user-stake-amount (/ (* user-stake-amount remaining-pool) total-winning-stake)))
         )
       )
     )
@@ -445,7 +510,7 @@
 )
 
 ;; Update user curation statistics
-(define-public (update-user-curation-stats (user principal))
+(define-private (update-user-curation-stats (user principal))
   (let (
     (current-curator (default-to { total-curated: u0, quality-rating: u50, is-verified: false }
                       (map-get? question-curators { user: user })))
